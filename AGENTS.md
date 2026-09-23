@@ -19,7 +19,7 @@ The objective of this project is to generate **high-resolution, print-ready, mat
 ## 2. Repository Structure
 
 ```text
-├── run_maze_generator.bat        # Interactive Windows launcher (presets, custom dims, batch, settings)
+├── run_maze_generator.bat        # Interactive Windows launcher (presets, custom dims, batch, style/layout/page settings)
 ├── run_maze_generator.command    # Same launcher for macOS / Linux (double-clickable in Finder)
 ├── generate_maze_script.py       # Primary production script (High-Junction Single-Solution Generator)
 ├── generate_multi_path_maze.py   # Secondary script for braided/multi-route mazes (cycles enabled)
@@ -45,7 +45,35 @@ The maze is modeled on a 2D rectangular grid of size $R \times C$:
 2. **Near-Miss Exit Lures:** Sprouted in the mid-path ($25\%-70\%$), deceptive lures aggressively race toward the FINISH and terminate $\le 2$ cells away against the outer/partition wall.
 3. **Capacity-Checked Decoy Sprouting:** Decoy branches sprout only if they have room to grow $\ge 6$ cells deep, strictly avoiding branches in the final $18\%$ stretch before the exit.
 4. **Decoy Absorption & Directional Momentum:** Residual empty spaces are absorbed into existing decoy paths rather than creating stubs on the main path, eliminating short dead ends and compact $2 \times 2$ coils.
-5. **Boundary Openings:** The left wall of cell `(0, 0)` is opened for **START**, and the right wall of cell `(R-1, C-1)` is opened for **FINISH**.
+5. **Boundary Openings:** By default (`--layout corners`) the left wall of cell `(0, 0)` is opened for **START**, and the right wall of cell `(R-1, C-1)` is opened for **FINISH**. Other layouts put the openings on any pair of opposite walls; the whole pipeline works from `self.start` / `self.goal`, never hard-coded corners.
+
+The walk's reachability test is a goal-directed depth-first search over precomputed
+neighbour tables: it answers the same yes/no as a full flood fill, so seeds reproduce
+exactly, but touches roughly one corridor of cells instead of the whole board
+(~2x faster at 12x10, ~7x at 30x30).
+
+### Generation Styles (`--style`)
+
+| Style | Character |
+| :--- | :--- |
+| `deceptive` (default) | The pipeline above: deep decoys, anti-greedy forks, near-miss exit lures |
+| `backtracker` | Recursive backtracker: long twisting corridors, few dead ends |
+| `prim` | Randomized Prim: many short branches, busy look |
+| `kruskal` | Randomized Kruskal: even mix of short and medium dead ends |
+| `wilson` | Wilson's algorithm: unbiased uniform spanning tree |
+| `hunt-kill` | Hunt-and-kill: long winding passages, straighter runs |
+
+Every style yields a perfect maze (spanning tree, exactly one solution). `--loops N`
+then knocks through up to N dead ends to braid the maze: this deliberately creates
+cycles (multiple routes), the solution key shows the shortest one, and the spec
+printout says so instead of claiming a tree.
+
+### Layouts (`--layout`)
+
+`corners` (default, consumes no randomness so old seeds still reproduce), `sides`
+(left wall to right wall, random rows), `top-bottom` (top wall to bottom wall,
+random columns) and `random` (a random pair of opposite walls, possibly reversed).
+Positions come from the seeded RNG, so `--seed` still pins the whole sheet.
 
 ---
 
@@ -100,7 +128,30 @@ python generate_maze_script.py --rows 12 --cols 10 --name castle --outdir .
 
 # Legacy fixed filenames: always rewrite single_solution_maze.png
 python generate_maze_script.py --rows 12 --cols 10 --overwrite --outdir .
+
+# Variety: classic algorithm, openings on random opposite walls, 3 extra loops
+python generate_maze_script.py --style prim --layout random --loops 3 --outdir .
+
+# Puzzle book: 20 sheets on US Letter, numbered titles, one print-ready PDF
+python generate_maze_script.py -n 20 --page letter --title "Maze {n}" --pdf --outdir ./book
+
+# Themed sheet: custom labels and colours, square cells, landscape A4
+python generate_maze_script.py --page a4 --landscape --square-cells \
+    --start-label "Bunny" --finish-label "Carrot" --wall-color "#1e3a8a" --solution-color "#e11d48"
 ```
+
+Run `python generate_maze_script.py --help` for the full list. Appearance flags:
+`--page {sheet,letter,a4,square}`, `--size WxH`, `--landscape`, `--dpi`,
+`--wall-thickness`, `--wall-color`, `--solution-color`, `--background`,
+`--start-label`, `--finish-label`, `--no-labels`, `--title` (`{n}` = sheet number)
+and `--square-cells`. All sizes scale from the 1800 x 2400 design, and labels shrink
+to fit the page margin. The default `sheet` page is unchanged (1800 x 2400 px, 300 DPI).
+
+Labels use a bold TrueType font found on Windows (Arial), macOS (Arial) or Linux
+(DejaVu / Liberation / FreeSans), falling back to Pillow's scalable default font.
+
+`--pdf` combines a run into `<name>_book.pdf`: all puzzles first, then all answer
+keys. Pages are appended one at a time, so memory stays flat for large batches.
 
 ### Output Files
 
@@ -133,9 +184,15 @@ exist, after which leftover cells are absorbed back into existing decoys.
 
 ### Seed Selection
 
-Without `--seed`, the generator samples `--max-search` candidate seeds at random
-from a 10,000,000-wide space, scores each one, and picks at random among the
-`--top-k` (default 3) highest scorers. Two runs at the same dimensions therefore
+Without `--seed`, the generator samples up to `--max-search` candidate seeds at random
+from a 10,000,000-wide space (default 800 below 200 cells, 350 below 900, else 120),
+scores them in fixed rounds of 48, and picks at random among the `--top-k`
+(default 3) highest scorers. The search **stops early** after the first round in
+which `max(2 x top-k, 4)` candidates meet every Section 4 target; that usually
+takes 100-350 candidates instead of 800. The round size never depends on the worker
+count, so a `--pool-seed` replay is identical on any machine. `--exhaustive` scores
+the whole pool, and `--deterministic` always does (so it still picks the same maze as
+earlier versions). A single worker pool is shared by every sheet in a `--count` batch. Two runs at the same dimensions therefore
 produce different sheets of comparable quality. Every run prints the seed it used
 plus a ready-to-paste `--seed` command, so any sheet can be reproduced exactly.
 
@@ -144,8 +201,9 @@ plus a ready-to-paste `--seed` command, so any sheet can be reproduced exactly.
 ```python
 from generate_maze_script import HighJunctionSingleSolutionMaze
 
-# 1. Initialize maze
-maze = HighJunctionSingleSolutionMaze(rows=12, cols=10, seed=232)
+# 1. Initialize maze (algorithm/layout/loops are optional; defaults shown)
+maze = HighJunctionSingleSolutionMaze(rows=12, cols=10, seed=232,
+                                      algorithm="deceptive", layout="corners", loops=0)
 
 # 2. Solve and analyze
 solution, junctions = maze.solve()
@@ -154,6 +212,9 @@ print(f"Solution steps: {len(solution)}, Decision forks: {len(junctions)}")
 # 3. Render printable sheet and solution
 maze.render("output_maze.png", draw_solution=False, wall_thickness=14)
 maze.render("output_solution.png", draw_solution=True, wall_thickness=14)
+
+# Optional appearance keywords: image_size, wall_color, solution_color, background,
+# start_label, finish_label, title, square_cells, dpi, quiet
 ```
 
 ---
