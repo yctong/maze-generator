@@ -19,6 +19,12 @@ SCRIPT="generate_maze_script.py"
 OUTDIR="."
 MAX_SEARCH=""
 JOBS=""
+STYLE="deceptive"
+LAYOUT="corners"
+LOOPS="0"
+PAGE="sheet"
+TITLE=""
+PDF="N"
 
 # --- terminal helpers ------------------------------------------------------
 if [ -t 1 ] && command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
@@ -156,6 +162,32 @@ build_args() {
     [ -n "${G_SEED:-}" ] && EXTRA_ARGS+=(--seed "$G_SEED")
     [ -n "$MAX_SEARCH" ] && EXTRA_ARGS+=(--max-search "$MAX_SEARCH")
     [ -n "$JOBS" ] && EXTRA_ARGS+=(--jobs "$JOBS")
+    EXTRA_ARGS+=(--style "$STYLE" --layout "$LAYOUT" --page "$PAGE")
+    [ "$LOOPS" != "0" ] && EXTRA_ARGS+=(--loops "$LOOPS")
+    [ -n "$TITLE" ] && EXTRA_ARGS+=(--title "$TITLE")
+    # A book only makes sense when more than one sheet is written.
+    [ "$PDF" = "Y" ] && [ "${G_COUNT:-1}" -gt 1 ] && EXTRA_ARGS+=(--pdf)
+}
+
+# pick_option <varname> <title> <option>...  (each option "value|description")
+pick_option() {
+    local __var="$1" title="$2" i=1 ans
+    shift 2
+    printf '\n%s\n' "$title"
+    for opt in "$@"; do
+        printf '  [%d] %-12s %s\n' "$i" "${opt%%|*}" "${opt#*|}"
+        i=$((i + 1))
+    done
+    read -r -p "Choose (1-$#, blank = keep current): " ans || return 0
+    ans="${ans//[[:space:]]/}"
+    [ -z "$ans" ] && return 0
+    if [[ "$ans" =~ ^[0-9]+$ ]] && [ "$ans" -ge 1 ] && [ "$ans" -le "$#" ]; then
+        local chosen="${!ans}"
+        printf -v "$__var" '%s' "${chosen%%|*}"
+    else
+        warn "Invalid choice - keeping the current value."
+        sleep 1
+    fi
 }
 
 run_gen() {
@@ -263,6 +295,7 @@ do_batch() {
     ask_int b_rows "Enter rows (4-60)" 12 4 60 || return 0
     ask_int b_cols "Enter cols (4-60)" 10 4 60 || return 0
 
+    G_COUNT="$b_count"
     local batchdir="$OUTDIR/batch_$(date +%Y%m%d_%H%M%S)"
     mkdir -p "$batchdir" || { err "Could not create \"$batchdir\"."; pause_key; return 0; }
 
@@ -307,10 +340,16 @@ do_settings() {
         info "  [1] Output directory   (current: $OUTDIR)"
         info "  [2] Seed search depth  (current: ${MAX_SEARCH:-auto})"
         info "  [3] Parallel workers   (current: ${JOBS:-auto})"
-        info "  [4] Reset to defaults"
+        info "  [4] Maze style         (current: $STYLE)"
+        info "  [5] START/FINISH spots (current: $LAYOUT)"
+        info "  [6] Extra loops        (current: $LOOPS$([ "$LOOPS" = "0" ] && printf ' = single solution'))"
+        info "  [7] Page size          (current: $PAGE)"
+        info "  [8] Sheet title        (current: ${TITLE:-none})"
+        info "  [9] PDF book for batches (current: $PDF)"
+        info "  [R] Reset to defaults"
         info "  [0] Back to main menu"
         printf '\n'
-        read -r -p "Choose (0-4): " sc || return 0
+        read -r -p "Choose (0-9, R): " sc || return 0
         case "$sc" in
             1)
                 read -r -p "New output directory (blank = current folder): " newdir || newdir=""
@@ -329,7 +368,28 @@ do_settings() {
                 ;;
             2) if ask_int ms "Seeds to evaluate (blank = auto)" "" 1 100000; then MAX_SEARCH="$ms"; else MAX_SEARCH=""; fi ;;
             3) if ask_int jb "Worker processes (blank = auto)" "" 1 64; then JOBS="$jb"; else JOBS=""; fi ;;
-            4) OUTDIR="."; MAX_SEARCH=""; JOBS="" ;;
+            4) pick_option STYLE "Maze style:" \
+                   "deceptive|Deep decoys, anti-greedy forks, exit lures (default)" \
+                   "backtracker|Long twisting corridors, few dead ends" \
+                   "prim|Many short branches, busy look" \
+                   "kruskal|Even mix of short and medium dead ends" \
+                   "wilson|Unbiased uniform maze" \
+                   "hunt-kill|Long winding passages, straighter runs" ;;
+            5) pick_option LAYOUT "START / FINISH placement:" \
+                   "corners|Top-left to bottom-right (default)" \
+                   "sides|Left wall to right wall, random rows" \
+                   "top-bottom|Top wall to bottom wall, random columns" \
+                   "random|Random opposite walls every sheet" ;;
+            6) if ask_int jb "Loops to add (0 = single solution)" 0 0 200; then LOOPS="$jb"; fi ;;
+            7) pick_option PAGE "Page size:" \
+                   "sheet|1800 x 2400 px, 3:4 (default)" \
+                   "letter|US Letter 8.5 x 11 in" \
+                   "a4|A4 210 x 297 mm" \
+                   "square|8 x 8 in" ;;
+            8) read -r -p "Title (use {n} for the sheet number, blank = none): " TITLE || TITLE="" ;;
+            9) if [ "$PDF" = "Y" ]; then PDF="N"; else PDF="Y"; fi ;;
+            [Rr]) OUTDIR="."; MAX_SEARCH=""; JOBS=""; STYLE="deceptive"; LAYOUT="corners"
+                  LOOPS="0"; PAGE="sheet"; TITLE=""; PDF="N" ;;
             0) return 0 ;;
             *) ;;
         esac
@@ -346,7 +406,8 @@ while true; do
     info "${DIM}  Interpreter : $PY  ($PYVER)"
     info "  Output dir  : $OUTDIR"
     info "  Seed search : ${MAX_SEARCH:-auto}"
-    info "  Workers     : ${JOBS:-auto (CPU-1)}${RESET}"
+    info "  Workers     : ${JOBS:-auto (CPU-1)}"
+    info "  Style       : $STYLE, $LAYOUT layout, $LOOPS loop(s), $PAGE page${RESET}"
     info "$RULE"
     printf '\n'
     info "  [1] Standard Deceptive Maze     (12 rows x 10 cols, Auto-Optimized)"
@@ -355,9 +416,9 @@ while true; do
     info "  [4] Master / Extra Large Maze   (20 rows x 15 cols, Auto-Optimized)"
     info "  [5] Reproduce Specific Seed     (Custom Seed & Dimensions)"
     info "  [6] Custom Dimensions           (Enter your own rows & cols)"
-    info "  [7] Batch Generate              (Many mazes into a timestamped folder)"
+    info "  [7] Batch Generate              (Many mazes + optional PDF book)"
     info "  [8] View Latest Generated Maze  (Open PNGs)"
-    info "  [9] Settings                    (Output folder, search depth, workers)"
+    info "  [9] Settings                    (Style, layout, page, title, PDF, workers)"
     info "  [0] Exit"
     printf '\n'
     info "$RULE"

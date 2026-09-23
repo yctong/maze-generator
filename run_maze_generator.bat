@@ -12,6 +12,12 @@ set "SCRIPT=generate_maze_script.py"
 set "OUTDIR=."
 set "MAX_SEARCH="
 set "JOBS="
+set "STYLE=deceptive"
+set "LAYOUT=corners"
+set "LOOPS=0"
+set "PAGE=sheet"
+set "TITLE="
+set "PDF=N"
 
 :: ------------------------------------------------------------------
 :: Environment checks
@@ -87,6 +93,7 @@ echo   Interpreter : %PY%  (%PYVER%)
 echo   Output dir  : %OUTDIR%
 if defined MAX_SEARCH (echo   Seed search : %MAX_SEARCH% seeds) else (echo   Seed search : auto)
 if defined JOBS (echo   Workers     : %JOBS%) else (echo   Workers     : auto ^(CPU-1^))
+echo   Style       : %STYLE%, %LAYOUT% layout, %LOOPS% loop(s), %PAGE% page
 echo ====================================================================
 echo.
 echo   [1] Standard Deceptive Maze     (12 rows x 10 cols, Auto-Optimized)
@@ -95,9 +102,9 @@ echo   [3] Advanced / Complex Maze     (16 rows x 12 cols, Auto-Optimized)
 echo   [4] Master / Extra Large Maze   (20 rows x 15 cols, Auto-Optimized)
 echo   [5] Reproduce Specific Seed     (Custom Seed ^& Dimensions)
 echo   [6] Custom Dimensions           (Enter your own rows ^& cols)
-echo   [7] Batch Generate              (Many mazes into a timestamped folder)
+echo   [7] Batch Generate              (Many mazes + optional PDF book)
 echo   [8] View Latest Generated Maze  (Open PNGs)
-echo   [9] Settings                    (Output folder, search depth, workers)
+echo   [9] Settings                    (Style, layout, page, title, PDF, workers)
 echo   [0] Exit
 echo.
 echo ====================================================================
@@ -207,6 +214,7 @@ set "BATCHDIR=%OUTDIR%\batch_!STAMP!"
 mkdir "!BATCHDIR!" 2>nul
 
 set "G_SEED="
+set "G_COUNT=!b_count!"
 call :BUILD_ARGS
 %PY% "%SCRIPT%" --rows !b_rows! --cols !b_cols! --outdir "!BATCHDIR!" --count !b_count! !EXTRA_ARGS!
 set "RC=!errorlevel!"
@@ -239,11 +247,17 @@ echo ====================================================================
 echo   [1] Output directory   (current: %OUTDIR%)
 if defined MAX_SEARCH (echo   [2] Seed search depth  ^(current: %MAX_SEARCH%^)) else (echo   [2] Seed search depth  ^(current: auto^))
 if defined JOBS (echo   [3] Parallel workers   ^(current: %JOBS%^)) else (echo   [3] Parallel workers   ^(current: auto^))
-echo   [4] Reset to defaults
+echo   [4] Maze style         (current: %STYLE%)
+echo   [5] START/FINISH spots (current: %LAYOUT%)
+echo   [6] Extra loops        (current: %LOOPS%, 0 = single solution)
+echo   [7] Page size          (current: %PAGE%)
+if defined TITLE (echo   [8] Sheet title        ^(current: !TITLE!^)) else (echo   [8] Sheet title        ^(current: none^))
+echo   [9] PDF book for batches (current: %PDF%)
+echo   [R] Reset to defaults
 echo   [0] Back to main menu
 echo.
 set "sc="
-set /p sc="Choose (0-4): "
+set /p sc="Choose (0-9, R): "
 
 if "%sc%"=="1" (
     set "newdir="
@@ -269,13 +283,85 @@ if "%sc%"=="3" (
     if errorlevel 1 (set "JOBS=") else (set "JOBS=!jb!")
     goto SETTINGS
 )
-if "%sc%"=="4" (
+if "%sc%"=="4" goto PICK_STYLE
+if "%sc%"=="5" goto PICK_LAYOUT
+if "%sc%"=="6" (
+    call :ASK_INT lp "Loops to add (0 = single solution)" 0 0 200
+    if not errorlevel 1 set "LOOPS=!lp!"
+    goto SETTINGS
+)
+if "%sc%"=="7" goto PICK_PAGE
+if "%sc%"=="8" (
+    set "TITLE="
+    set /p TITLE="Title (use {n} for the sheet number, blank = none): "
+    goto SETTINGS
+)
+if "%sc%"=="9" (
+    if "!PDF!"=="Y" (set "PDF=N") else (set "PDF=Y")
+    goto SETTINGS
+)
+if /i "%sc%"=="R" (
     set "OUTDIR=."
     set "MAX_SEARCH="
     set "JOBS="
+    set "STYLE=deceptive"
+    set "LAYOUT=corners"
+    set "LOOPS=0"
+    set "PAGE=sheet"
+    set "TITLE="
+    set "PDF=N"
     goto SETTINGS
 )
 if "%sc%"=="0" goto MENU
+goto SETTINGS
+
+:PICK_STYLE
+echo.
+echo Maze style:
+echo   [1] deceptive    Deep decoys, anti-greedy forks, exit lures (default)
+echo   [2] backtracker  Long twisting corridors, few dead ends
+echo   [3] prim         Many short branches, busy look
+echo   [4] kruskal      Even mix of short and medium dead ends
+echo   [5] wilson       Unbiased uniform maze
+echo   [6] hunt-kill    Long winding passages, straighter runs
+set "pk="
+set /p pk="Choose (1-6, blank = keep current): "
+if "!pk!"=="1" set "STYLE=deceptive"
+if "!pk!"=="2" set "STYLE=backtracker"
+if "!pk!"=="3" set "STYLE=prim"
+if "!pk!"=="4" set "STYLE=kruskal"
+if "!pk!"=="5" set "STYLE=wilson"
+if "!pk!"=="6" set "STYLE=hunt-kill"
+goto SETTINGS
+
+:PICK_LAYOUT
+echo.
+echo START / FINISH placement:
+echo   [1] corners      Top-left to bottom-right (default)
+echo   [2] sides        Left wall to right wall, random rows
+echo   [3] top-bottom   Top wall to bottom wall, random columns
+echo   [4] random       Random opposite walls every sheet
+set "pk="
+set /p pk="Choose (1-4, blank = keep current): "
+if "!pk!"=="1" set "LAYOUT=corners"
+if "!pk!"=="2" set "LAYOUT=sides"
+if "!pk!"=="3" set "LAYOUT=top-bottom"
+if "!pk!"=="4" set "LAYOUT=random"
+goto SETTINGS
+
+:PICK_PAGE
+echo.
+echo Page size:
+echo   [1] sheet        1800 x 2400 px, 3:4 (default)
+echo   [2] letter       US Letter 8.5 x 11 in
+echo   [3] a4           A4 210 x 297 mm
+echo   [4] square       8 x 8 in
+set "pk="
+set /p pk="Choose (1-4, blank = keep current): "
+if "!pk!"=="1" set "PAGE=sheet"
+if "!pk!"=="2" set "PAGE=letter"
+if "!pk!"=="3" set "PAGE=a4"
+if "!pk!"=="4" set "PAGE=square"
 goto SETTINGS
 
 :: ------------------------------------------------------------------
@@ -355,6 +441,12 @@ set "EXTRA_ARGS="
 if defined G_SEED set "EXTRA_ARGS=!EXTRA_ARGS! --seed !G_SEED!"
 if defined MAX_SEARCH set "EXTRA_ARGS=!EXTRA_ARGS! --max-search !MAX_SEARCH!"
 if defined JOBS set "EXTRA_ARGS=!EXTRA_ARGS! --jobs !JOBS!"
+set "EXTRA_ARGS=!EXTRA_ARGS! --style !STYLE! --layout !LAYOUT! --page !PAGE!"
+if not "!LOOPS!"=="0" set "EXTRA_ARGS=!EXTRA_ARGS! --loops !LOOPS!"
+if defined TITLE set "EXTRA_ARGS=!EXTRA_ARGS! --title "!TITLE!""
+:: A book only makes sense when more than one sheet is written.
+if not defined G_COUNT set "G_COUNT=1"
+if /i "!PDF!"=="Y" if !G_COUNT! GTR 1 set "EXTRA_ARGS=!EXTRA_ARGS! --pdf"
 exit /b 0
 
 :: ASK_INT <varname> <prompt> <default|""> <min> <max>
