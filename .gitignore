@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+
+# Generated sheets and books (written to --outdir)
+*_[0-9][0-9][0-9].png
+*_[0-9][0-9][0-9]_solution.png
+single_solution_maze*.png
+*_book*.pdf
