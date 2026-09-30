@@ -21,12 +21,15 @@ The objective of this project is to generate **high-resolution, print-ready, mat
 ```text
 ├── run_maze_generator.bat        # Interactive Windows launcher (presets, custom dims, batch, style/layout/page settings)
 ├── run_maze_generator.command    # Same launcher for macOS / Linux (double-clickable in Finder)
-├── generate_maze_script.py       # Primary production script (High-Junction Single-Solution Generator)
-├── generate_multi_path_maze.py   # Secondary script for braided/multi-route mazes (cycles enabled)
-├── maze_coloring_sheet.md        # User-facing markdown artifact with interactive carousel previews
-├── maze_001.png                  # Generated clean printable maze (1800 x 2400 px)
-├── maze_001_solution.png         # Color-coded verified solution key for that sheet
+├── generate_maze_script.py       # The generator: all styles, layouts, loops (--loops braids a maze), rendering, PDF books
+├── .gitignore                    # Keeps __pycache__ and generated sheets out of git
 └── AGENTS.md                     # Agent developer guide & specifications (this file)
+```
+
+Generated sheets (`maze_NNN.png` + `maze_NNN_solution.png`, `*_book.pdf`) are written to
+`--outdir` and are not tracked.
+
+```text
 ```
 
 ---
@@ -41,16 +44,22 @@ The maze is modeled on a 2D rectangular grid of size $R \times C$:
 - **Vertical Walls (`v_walls`):** Array of shape $(R, C + 1)$ representing left/right cell boundaries.
 
 ### Generator Pipeline (`HighJunctionSingleSolutionMaze`)
-1. **Orphan-Free Primary Path Carving:** A self-avoiding random walk with anti-greedy heuristics carves a winding path covering 35%–45% of total grid cells from `(0, 0)` to `(R-1, C-1)` without leaving orphaned $1 \times 1$ dead pockets.
-2. **Near-Miss Exit Lures:** Sprouted in the mid-path ($25\%-70\%$), deceptive lures aggressively race toward the FINISH and terminate $\le 2$ cells away against the outer/partition wall.
-3. **Capacity-Checked Decoy Sprouting:** Decoy branches sprout only if they have room to grow $\ge 6$ cells deep, strictly avoiding branches in the final $18\%$ stretch before the exit.
-4. **Decoy Absorption & Directional Momentum:** Residual empty spaces are absorbed into existing decoy paths rather than creating stubs on the main path, eliminating short dead ends and compact $2 \times 2$ coils.
-5. **Boundary Openings:** By default (`--layout corners`) the left wall of cell `(0, 0)` is opened for **START**, and the right wall of cell `(R-1, C-1)` is opened for **FINISH**. Other layouts put the openings on any pair of opposite walls; the whole pipeline works from `self.start` / `self.goal`, never hard-coded corners.
+1. **Pocket-Free Primary Path Carving:** A self-avoiding random walk with anti-greedy heuristics carves a winding path covering 28%–48% of total grid cells from START to FINISH. It never seals off a pocket too small to hold a $\ge 5$-step decoy (`min_comp_size`, 6 cells): at the old 3-cell floor, such pockets produced most sub-5-step decoys. For its first quarter the walk also shies away from cells touching its own path, so it doesn't coil tightly in the START corner and leave no room for an early decision.
+2. **Reserved End Forks:** One fork is tried just after START (first 12% of the path) and one just before the no-branch zone (70%–85%), *before* the lures claim the space around FINISH. Without this the first decision came ~11 steps in and the last ~27% of the path was fork-free, so tracing backwards from FINISH was a free shortcut.
+3. **Near-Miss Exit Lures:** Sprouted in the mid-path ($25\%-70\%$), deceptive lures aggressively race toward the FINISH and terminate $\le 2$ cells away against the outer/partition wall.
+4. **Capacity-Checked Decoy Sprouting:** Decoy branches sprout only where there is room for a deep decoy, never in the final $15\%$ of the path. Until one 4-way fork exists (two on grids of 300+ cells), a path cell that gets a decoy also tries its opposite free side, giving the solution a genuine three-way choice. Decoys keep mild directional momentum (1.6x): enough to avoid $2 \times 2$ coils, not so much that they become straight corridors whose dead end is visible from the fork.
+5. **Decoy Absorption:** Residual empty spaces are absorbed into existing decoy paths. A pocket walled in by the solution path alone is first absorbed *into* the solution as a detour (a route covering every pocket cell replaces one path step), and only hangs off the path as a short fork when no such route exists.
+6. **Stub Rewiring:** 1-cell dead ends (a leaf hanging straight off a junction) are removed by tree edge swaps: open a wall next to the stub, then remove another edge of the cycle this creates. A swap is kept only if it strictly reduces the stub count. Edges touching the solution path are never added or removed, except that a 1-step decoy hanging off the path (itself a stub) may be re-hung elsewhere. This roughly halves the 1-cell notches.
+7. **Boundary Openings:** By default (`--layout corners`) the left wall of cell `(0, 0)` is opened for **START**, and the right wall of cell `(R-1, C-1)` is opened for **FINISH**. Other layouts put the openings on any pair of opposite walls; the whole pipeline works from `self.start` / `self.goal`, never hard-coded corners.
 
 The walk's reachability test is a goal-directed depth-first search over precomputed
-neighbour tables: it answers the same yes/no as a full flood fill, so seeds reproduce
-exactly, but touches roughly one corridor of cells instead of the whole board
-(~2x faster at 12x10, ~7x at 30x30).
+neighbour tables: it answers the same yes/no as a full flood fill, but touches roughly
+one corridor of cells instead of the whole board (~2x faster at 12x10, ~7x at 30x30).
+
+**Seed compatibility:** a seed always rebuilds the same maze *within* a version, but the
+design changes above (pocket floor, reserved end forks, 4-way forks, detours, stub rewiring)
+consume randomness differently, so seeds printed by earlier versions produce different
+mazes now.
 
 ### Generation Styles (`--style`)
 
@@ -70,7 +79,7 @@ printout says so instead of claiming a tree.
 
 ### Layouts (`--layout`)
 
-`corners` (default, consumes no randomness so old seeds still reproduce), `sides`
+`corners` (default; consumes no randomness), `sides`
 (left wall to right wall, random rows), `top-bottom` (top wall to bottom wall,
 random columns) and `random` (a random pair of opposite walls, possibly reversed).
 Positions come from the seeded RNG, so `--seed` still pins the whole sheet.
@@ -81,6 +90,21 @@ Positions come from the seeded RNG, so `--seed` still pins the whole sheet.
 
 When generating or modifying mazes, agents must evaluate and report the following metrics:
 
+`design_metrics()` computes all of these in one place, and both the seed scorer and the
+printed spec sheet use it. A candidate "meets spec" when it hits every hard target
+below; 4-way forks and 1-cell dead ends only move the score.
+
+Measured over 15 default search runs per size (earlier version → current):
+
+| Grid | Winners meeting spec | Candidates scored | First decision | 1-cell dead ends | 4-way forks |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 12x10 | 6/15 → **15/15** | 589 → 272 | step 10.7 → 2.3 | 6.0 → 1.9 | 0.07 → 0.47 |
+| 16x12 | 12/15 → **15/15** | 192 → 61 | step 12.2 → 4.9 | 8.6 → 2.5 | 0 → 0.53 |
+| 20x15 | 14/15 → **15/15** | 125 → 58 | step 17.1 → 6.4 | 11.6 → 4.3 | 0.07 → 0.73 |
+
+The "current" column is measured against the stricter targets (early decision and
+decoy turns included).
+
 | Metric | Target / Standard | Description |
 | :--- | :--- | :--- |
 | **Solvability** | Exactly $1$ unique path | Verified via BFS pathfinder. |
@@ -90,8 +114,14 @@ When generating or modifying mazes, agents must evaluate and report the followin
 | **Max Decoy Depth** | $\ge 15$ steps | Deepest false branch to prevent visual elimination shortcuts. |
 | **Anti-Greedy Forks** | $\ge 2$ junctions | Forks where false paths move closer to goal than the true path. |
 | **Near-Miss Exit Lures** | $\ge 1$ lure | Decoy reaching within $\le 2$ cells of the FINISH opening. |
-| **Branches Near End** | $0$ branches | Zero distracting/useless branches in the final $15\%$ of the path. |
+| **Branches Near End** | $0$ branches | Zero distracting/useless branches in the final $15\%$ of the path (the scorer checks the full 15%, not just the last few steps). |
+| **Early Decision** | first fork within the first $15\%$ | No long choice-free run from START. |
+| **Min Decoy Turns** | $\ge 2$ turns | Every decoy bends at least twice, so its dead end can't be seen from the fork. Depth counts steps; turns count how hard a decoy is to rule out by eye. |
+| **4-Way Forks** | $\ge 1$ preferred | Scored bonus, not a hard target: about half of all sheets get one. |
+| **1-Cell Dead Ends** | as few as possible | Scored penalty for 1-cell notches anywhere in the maze, including inside decoys. |
 | **Resolution** | $1800 \times 2400\text{ px}$ | 3:4 portrait aspect ratio (standard 300 DPI for Letter/A4 printing). |
+| **Print-Safe Margin** | $\ge 0.2\text{ in}$ | Arrows, labels and title stay $\ge 0.2$ in (60 px at 300 DPI) from the page edge, where home printers clip. Long labels shrink to fit. |
+| **Cell Shape** | within $10\%$ of square | Grids that don't match the page (e.g. $8 \times 8$ on 3:4) are centred instead of stretched. |
 | **Wall Thickness** | $12\text{px} - 16\text{px}$ | Bold, clean lines easy for crayons and markers. |
 
 ---
@@ -144,8 +174,11 @@ Run `python generate_maze_script.py --help` for the full list. Appearance flags:
 `--page {sheet,letter,a4,square}`, `--size WxH`, `--landscape`, `--dpi`,
 `--wall-thickness`, `--wall-color`, `--solution-color`, `--background`,
 `--start-label`, `--finish-label`, `--no-labels`, `--title` (`{n}` = sheet number)
-and `--square-cells`. All sizes scale from the 1800 x 2400 design, and labels shrink
-to fit the page margin. The default `sheet` page is unchanged (1800 x 2400 px, 300 DPI).
+and `--square-cells`. All sizes scale from the 1800 x 2400 design. Cells are kept within
+10% of square (`--square-cells` makes them exact), and the top and bottom margins shrink
+from 360 to 300 px when neither opening is on those walls, so the grid gets the height.
+Arrows, labels and the title keep a 0.2 in print-safe margin; labels shrink to fit
+rather than cross it. The default `sheet` page is still 1800 x 2400 px at 300 DPI.
 
 Labels use a bold TrueType font found on Windows (Arial), macOS (Arial) or Linux
 (DejaVu / Liberation / FreeSans), falling back to Pillow's scalable default font.
@@ -171,7 +204,7 @@ replays that search; the rest draw fresh pools so the batch stays varied.
 The 5-9 fork target and the "min decoy depth $\ge 5$" target compete for the same
 resource: the free cells the solution path leaves behind. Below roughly 100 cells
 there is not enough room for both - at $8 \times 8$, **zero of 400 sampled seeds**
-satisfied both at once. Because *Zero Short Dead Ends* is the project's first
+satisfied both at once (1 of 400 in the current version). Because *Zero Short Dead Ends* is the project's first
 design rule, `score_seed` applies the fork-band bonus only when
 `total_cells >= 100`; smaller sheets (the Junior $8 \times 8$ preset) keep deep
 decoys and settle for ~4 forks. Grids at or above $10 \times 10$ hit both targets.
@@ -191,8 +224,12 @@ scores them in fixed rounds of 48, and picks at random among the `--top-k`
 which `max(2 x top-k, 4)` candidates meet every Section 4 target; that usually
 takes 100-350 candidates instead of 800. The round size never depends on the worker
 count, so a `--pool-seed` replay is identical on any machine. `--exhaustive` scores
-the whole pool, and `--deterministic` always does (so it still picks the same maze as
-earlier versions). A single worker pool is shared by every sheet in a `--count` batch. Two runs at the same dimensions therefore
+the whole pool, and `--deterministic` always does (same maze for a given size, every run).
+Candidates that meet **every** Section 4 target always outrank those that don't; the
+weighted score only orders candidates within each group, and the top-k pick never
+reaches past the spec-meeting ones when any exist. (Ranking by score alone used to pick
+a maze that missed a target in 9 of 15 default runs, even though spec-meeting
+candidates had been found every time.) A single worker pool is shared by every sheet in a `--count` batch. Two runs at the same dimensions therefore
 produce different sheets of comparable quality. Every run prints the seed it used
 plus a ready-to-paste `--seed` command, so any sheet can be reproduced exactly.
 

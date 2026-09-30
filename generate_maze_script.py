@@ -18,7 +18,7 @@ ALGORITHMS = {
 }
 
 # Where the START and FINISH openings go. "corners" is the original layout and
-# consumes no randomness, so every seed from earlier versions still reproduces.
+# consumes no randomness.
 LAYOUTS = {
     "corners": "START top-left (left wall), FINISH bottom-right (right wall)",
     "sides": "START on the left wall, FINISH on the right wall, random rows",
@@ -162,10 +162,14 @@ class HighJunctionSingleSolutionMaze:
         goal = self.goal
         visited = [[False for _ in range(cols)] for _ in range(rows)]
 
-        # --- 1. CARVE DETOURING MAIN PATH WITHOUT ORPHANING 1x1 POCKETS ---
+        # --- 1. CARVE DETOURING MAIN PATH WITHOUT ORPHANING SMALL POCKETS ---
         target_len = int(rows * cols * 0.38)
-        min_comp_size = max(3, int(min(rows, cols) * 0.3))
+        # A pocket sealed off by the path alone can only become a fork whose
+        # decoy fits inside it, so pockets must hold a >= 5-step decoy. (At 3,
+        # 3-4 cell pockets produced most of the sub-5-step decoys.)
+        min_comp_size = max(6, int(min(rows, cols) * 0.3))
         away_target = max(6, int(rows * cols * 0.08))
+        early_len = max(4, int(target_len * 0.25))
         
         # Flat-index helpers: the walk runs on a 1-D grid to avoid tuple churn.
         n_cells = rows * cols
@@ -308,11 +312,19 @@ class HighJunctionSingleSolutionMaze:
                 if len(path) < target_len:
                     pool = list(cand)
                     weights = []
-                    for _, nr, nc in pool:
+                    early = len(path) < early_len
+                    for j, nr, nc in pool:
                         d = abs(nr - goal[0]) + abs(nc - goal[1])
                         w = 1.0 + (d / (rows + cols)) * 2.5
                         if nr == 0 or nc == 0 or nr == rows - 1 or nc == cols - 1:
                             w += 1.2
+                        if early:
+                            # The START corner is the farthest point from the
+                            # goal, so the detour weights make the walk coil
+                            # tightly there and leave no room for a first fork.
+                            # Early on, shy away from cells that touch the path.
+                            touching = sum(1 for k in nbrs[j] if blocked[k] and k != i)
+                            w *= 0.15 ** touching
                         weights.append(w)
                     order = []
                     while pool:
@@ -398,7 +410,122 @@ class HighJunctionSingleSolutionMaze:
         main_set = set(main_path)
         decoy_cells = set()
 
-        # --- 2. SPROUT NEAR-MISS EXIT LURES (ONLY IN MID-PATH: 25% to 70%) ---
+        # --- 2. FORK SETUP + RESERVED END FORKS (NO BRANCHES IN THE FINAL 15% OF PATH) ---
+        n_path = len(main_path)
+        branch_cutoff = int(n_path * 0.85)
+        stride = 2 if rows * cols <= 150 else 3
+        possible_indices = list(range(3, branch_cutoff, stride))
+        random.shuffle(possible_indices)
+        # Left to chance, the first decision tends to come 10+ steps in and the
+        # last one well before the 15% cutoff, so both ends of the solution read
+        # as free corridor (and solving backwards from FINISH is a shortcut).
+        # Try one fork slot just after START and one just before the cutoff
+        # first; the shuffled middle follows.
+        early_window = list(range(1, max(3, int(n_path * 0.12))))
+        late_window = list(range(max(3, int(n_path * 0.70)), branch_cutoff))
+        random.shuffle(early_window)
+        random.shuffle(late_window)
+        priority = early_window[:3] + late_window[:3]
+        possible_indices = priority + [i for i in possible_indices if i not in priority]
+
+        min_branch_cap = max(4, int(min(rows, cols) * 0.5))
+
+        # Aim for the 5-9 decision-fork band. Unbudgeted, the first branch floods
+        # every free cell via DFS and the solution ends up with only 2-4 forks, so
+        # each branch is capped until enough distinct junctions exist. Leftover
+        # cells are absorbed back into these decoys in stage 5, which keeps the
+        # "no short dead ends" property intact.
+        free_cells = sum(row.count(False) for row in visited)
+        target_junctions = random.randint(5, 8)
+        branch_budget = max(min_branch_cap + 2, free_cells // (target_junctions + 1))
+        junctions_made = 0
+        # A 4-way fork is a path cell with decoys on both free sides. It only
+        # happens when both sides still have room, so it is opportunistic.
+        four_way_target = 1 if rows * cols < 300 else 2
+        four_way_made = 0
+        early_done = late_done = False
+
+        def room_for_branch(nr, nc):
+            q = [(nr, nc)]
+            q_vis = {(nr, nc)}
+            while q and len(q_vis) < min_branch_cap + 3:
+                qr, qc = q.pop()
+                for qdr, qdc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    qnr, qnc = qr + qdr, qc + qdc
+                    if 0 <= qnr < rows and 0 <= qnc < cols and not visited[qnr][qnc] and (qnr, qnc) not in q_vis:
+                        q_vis.add((qnr, qnc))
+                        q.append((qnr, qnc))
+            return len(q_vis) >= min_branch_cap
+
+        def carve_branch(br, bc, nr, nc, first_dir, budget):
+            visited[nr][nc] = True
+            decoy_cells.add((nr, nc))
+            self._remove_wall(br, bc, nr, nc)
+            branch_len = 1
+            b_stack = [(nr, nc, first_dir)]
+            while b_stack and branch_len < budget:
+                curr_r, curr_c, last_dir = b_stack[-1]
+                b_nbrs = []
+                for bdr, bdc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    bnr, bnc = curr_r + bdr, curr_c + bdc
+                    if 0 <= bnr < rows and 0 <= bnc < cols and not visited[bnr][bnc]:
+                        b_nbrs.append((bnr, bnc, (bdr, bdc)))
+                if b_nbrs:
+                    # Mild momentum: enough to avoid tight 2x2 coils, not so much
+                    # that decoys become straight corridors whose dead end is
+                    # visible at a glance.
+                    weights = [1.6 if n[2] == last_dir else 1.0 for n in b_nbrs]
+                    bnr, bnc, new_dir = random.choices(b_nbrs, weights=weights, k=1)[0]
+                    visited[bnr][bnc] = True
+                    decoy_cells.add((bnr, bnc))
+                    self._remove_wall(curr_r, curr_c, bnr, bnc)
+                    b_stack.append((bnr, bnc, new_dir))
+                    branch_len += 1
+                else:
+                    b_stack.pop()
+
+        def sprout_at(idx):
+            nonlocal junctions_made, four_way_made, early_done, late_done
+            in_early = idx in early_window
+            in_late = idx in late_window
+            if idx in priority and ((in_early and early_done) or (in_late and late_done)):
+                return  # one reserved fork per end is enough
+            br, bc = main_path[idx]
+            made_here = 0
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = br + dr, bc + dc
+                if not (0 <= nr < rows and 0 <= nc < cols) or visited[nr][nc]:
+                    continue
+                if not room_for_branch(nr, nc):
+                    continue
+                # Only ration space while we still owe the maze more forks.
+                budget = branch_budget if junctions_made < target_junctions else 10 ** 9
+                if made_here:
+                    # Second decoy from the same cell: split the ration so the
+                    # 4-way fork does not starve the forks still to come.
+                    budget = max(min_branch_cap + 2, budget // 2) if budget < 10 ** 9 else budget
+                carve_branch(br, bc, nr, nc, (dr, dc), budget)
+                made_here += 1
+                if made_here == 1:
+                    junctions_made += 1
+                    early_done = early_done or in_early
+                    late_done = late_done or in_late
+                    if four_way_made < four_way_target:
+                        continue  # try the opposite free side for a 4-way fork
+                else:
+                    four_way_made += 1
+                if junctions_made < target_junctions:
+                    # One fork per path cell until the target is met, so the
+                    # remaining free space seeds junctions further along.
+                    break
+
+        # The reserved end-forks go first: the exit lures below race into the
+        # free space around FINISH and would otherwise leave no room for a
+        # decision in the last stretch before the cutoff.
+        for idx in priority:
+            sprout_at(idx)
+
+        # --- 3. SPROUT NEAR-MISS EXIT LURES (ONLY IN MID-PATH: 25% to 70%) ---
         mid_indices = list(range(len(main_path) // 4, int(len(main_path) * 0.70)))
         random.shuffle(mid_indices)
         
@@ -463,75 +590,11 @@ class HighJunctionSingleSolutionMaze:
             if lures_created >= 2:
                 break
 
-        # --- 3. SPROUT BALANCED DEEP FORKS (NO BRANCHES IN LAST 20% OF PATH) ---
-        branch_cutoff = int(len(main_path) * 0.80)
-        stride = 2 if rows * cols <= 150 else 3
-        possible_indices = list(range(3, branch_cutoff, stride))
-        random.shuffle(possible_indices)
-        
-        min_branch_cap = max(4, int(min(rows, cols) * 0.5))
+        # --- 4. SPREAD THE REMAINING FORKS ALONG THE PATH ---
+        for idx in possible_indices[len(priority):]:
+            sprout_at(idx)
 
-        # Aim for the 5-9 decision-fork band. Unbudgeted, the first branch floods
-        # every free cell via DFS and the solution ends up with only 2-4 forks, so
-        # each branch is capped until enough distinct junctions exist. Leftover
-        # cells are absorbed back into these decoys in stage 4, which keeps the
-        # "no short dead ends" property intact.
-        free_cells = sum(row.count(False) for row in visited)
-        target_junctions = random.randint(5, 8)
-        branch_budget = max(min_branch_cap + 2, free_cells // (target_junctions + 1))
-        junctions_made = 0
-
-        for idx in possible_indices:
-            br, bc = main_path[idx]
-            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                nr, nc = br + dr, bc + dc
-                if 0 <= nr < rows and 0 <= nc < cols and not visited[nr][nc]:
-                    q = [(nr, nc)]
-                    q_vis = set([(nr, nc)])
-                    while q and len(q_vis) < min_branch_cap + 3:
-                        qr, qc = q.pop(0)
-                        for qdr, qdc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                            qnr, qnc = qr + qdr, qc + qdc
-                            if 0 <= qnr < rows and 0 <= qnc < cols and not visited[qnr][qnc] and (qnr, qnc) not in q_vis:
-                                q_vis.add((qnr, qnc))
-                                q.append((qnr, qnc))
-                    if len(q_vis) < min_branch_cap:
-                        continue
-                        
-                    visited[nr][nc] = True
-                    decoy_cells.add((nr, nc))
-                    self._remove_wall(br, bc, nr, nc)
-                    
-                    # Only ration space while we still owe the maze more forks.
-                    budget = branch_budget if junctions_made < target_junctions else 10 ** 9
-                    branch_len = 1
-
-                    b_stack = [(nr, nc, (dr, dc))]
-                    while b_stack and branch_len < budget:
-                        curr_r, curr_c, last_dir = b_stack[-1]
-                        b_nbrs = []
-                        for bdr, bdc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                            bnr, bnc = curr_r + bdr, curr_c + bdc
-                            if 0 <= bnr < rows and 0 <= bnc < cols and not visited[bnr][bnc]:
-                                b_nbrs.append((bnr, bnc, (bdr, bdc)))
-                        if b_nbrs:
-                            weights = [2.5 if n[2] == last_dir else 1.0 for n in b_nbrs]
-                            bnr, bnc, new_dir = random.choices(b_nbrs, weights=weights, k=1)[0]
-                            visited[bnr][bnc] = True
-                            decoy_cells.add((bnr, bnc))
-                            self._remove_wall(curr_r, curr_c, bnr, bnc)
-                            b_stack.append((bnr, bnc, new_dir))
-                            branch_len += 1
-                        else:
-                            b_stack.pop()
-
-                    junctions_made += 1
-                    if junctions_made < target_junctions:
-                        # One fork per path cell until the target is met, so the
-                        # remaining free space seeds junctions further along.
-                        break
-
-        # --- 4. EXTEND EXISTING DECOY PATHS INTO ALL REMAINING CELLS (NEVER TOUCH MAIN PATH) ---
+        # --- 5. EXTEND EXISTING DECOY PATHS INTO ALL REMAINING CELLS (NEVER TOUCH MAIN PATH) ---
         unvis_cells = [(r, c) for r in range(rows) for c in range(cols) if not visited[r][c]]
         while unvis_cells:
             connected = False
@@ -568,6 +631,12 @@ class HighJunctionSingleSolutionMaze:
                     break
                     
             if not connected:
+                # Pocket walled in by the solution path alone. Hanging it off
+                # the path would add a short fork (most sub-5-step decoys come
+                # from here), so first try to reroute the path through it.
+                connected = self._detour_through_pocket(main_path, main_set, visited)
+            if not connected:
+                # No detour covers it: it has to hang off the path as a short fork.
                 for r, c in unvis_cells:
                     for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                         nr, nc = r + dr, c + dc
@@ -579,8 +648,186 @@ class HighJunctionSingleSolutionMaze:
                             break
                     if connected:
                         break
-                        
+
             unvis_cells = [(r, c) for r in range(rows) for c in range(cols) if not visited[r][c]]
+
+        # --- 6. REWIRE AWAY 1-CELL DEAD ENDS ---
+        self._merge_stubs(main_set)
+
+    def _detour_through_pocket(self, path, path_set, visited, max_pocket=12):
+        """Absorb a pocket of unvisited cells into the solution path.
+
+        Finds consecutive path cells a, b and a route through *every* pocket
+        cell from a neighbour of a to a neighbour of b, then swaps the a-b
+        passage for that route. The pocket gains k cells and k passages while
+        a-b loses one, so the maze stays a spanning tree; the solution just
+        gets k steps longer. ``path`` and ``path_set`` are updated in place.
+        Returns False when the pocket is too big or no covering route exists.
+        """
+        rows, cols = self.rows, self.cols
+        seed_cell = next(((r, c) for r in range(rows) for c in range(cols) if not visited[r][c]), None)
+        if seed_cell is None:
+            return False
+        pocket = {seed_cell}
+        q = deque([seed_cell])
+        while q:
+            u = q.popleft()
+            for v in self._neighbors(*u):
+                if not visited[v[0]][v[1]] and v not in pocket:
+                    pocket.add(v)
+                    q.append(v)
+        if len(pocket) > max_pocket:
+            return False
+
+        def covering_route(x, y):
+            # Hamiltonian path x -> y over the pocket; tiny, so plain DFS.
+            route = [x]
+            seen = {x}
+            budget = [20000]
+
+            def dfs():
+                budget[0] -= 1
+                if budget[0] < 0:
+                    return False
+                if len(route) == len(pocket):
+                    return route[-1] == y
+                for v in self._neighbors(*route[-1]):
+                    if v in pocket and v not in seen and (v != y or len(route) == len(pocket) - 1):
+                        seen.add(v)
+                        route.append(v)
+                        if dfs():
+                            return True
+                        route.pop()
+                        seen.discard(v)
+                return False
+            return list(route) if dfs() else None
+
+        for i in range(len(path) - 1):
+            a, b = path[i], path[i + 1]
+            xs = [n for n in self._neighbors(*a) if n in pocket]
+            ys = [n for n in self._neighbors(*b) if n in pocket]
+            for x in xs:
+                for y in ys:
+                    if x == y and len(pocket) > 1:
+                        continue
+                    route = covering_route(x, y)
+                    if not route:
+                        continue
+                    self._add_wall(*a, *b)
+                    for u, v in zip([a] + route, route + [b]):
+                        self._remove_wall(*u, *v)
+                    for r, c in route:
+                        visited[r][c] = True
+                    path[i + 1:i + 1] = route
+                    path_set.update(route)
+                    return True
+        return False
+
+    def _merge_stubs(self, protected=()):
+        """Rewire the tree so 1-cell dead ends disappear.
+
+        The "no short dead ends" rule is judged where a decoy leaves the
+        solution, but leftover-space filling also leaves 1-cell nubs (a dead
+        end hanging straight off a junction) that read as visual clutter.
+
+        For a nub L on junction J and a walled neighbour N of L, opening L-N
+        closes exactly one cycle (L, N, ..., J, L); removing any other edge of
+        that cycle gives back a spanning tree. A swap is kept only when it
+        strictly lowers the number of nubs, so the loop terminates. Edges that
+        touch ``protected`` (the solution path) are never removed and never
+        added, so the solution and its forks stay exactly as carved -- except
+        a 1-step decoy hanging off the path, which is itself a nub and may be
+        re-hung elsewhere. Returns the number of swaps made.
+        """
+        ends = {self.start, self.goal}
+        frozen = set(protected) | ends
+
+        def open_nbrs(cell):
+            r, c = cell
+            return [n for n in self._neighbors(r, c) if self._wall_open(r, c, *n)]
+
+        def is_stub(cell):
+            if cell in ends:
+                return False
+            nb = open_nbrs(cell)
+            return len(nb) == 1 and len(open_nbrs(nb[0])) >= 3
+
+        def stubs_near(cells):
+            # A cell's nub status depends only on its own degree and its one
+            # neighbour's, so a swap can only change it for these cells.
+            region = set(cells)
+            for x in cells:
+                region.update(self._neighbors(*x))
+            return sum(1 for x in region if is_stub(x))
+
+        def tree_path(a, b):
+            parent = {a: None}
+            q = deque([a])
+            while q:
+                u = q.popleft()
+                if u == b:
+                    break
+                for v in open_nbrs(u):
+                    if v not in parent:
+                        parent[v] = u
+                        q.append(v)
+            path = [b]
+            while parent[path[-1]] is not None:
+                path.append(parent[path[-1]])
+            return path
+
+        swaps = 0
+        progress = True
+        while progress:
+            progress = False
+            stubs = [(r, c) for r in range(self.rows) for c in range(self.cols)
+                     if (r, c) not in frozen and is_stub((r, c))]
+            for leaf in stubs:
+                if not is_stub(leaf):
+                    continue
+                hub = open_nbrs(leaf)[0]
+                others = [n for n in self._neighbors(*leaf) if n != hub and n not in frozen]
+                random.shuffle(others)
+                done = False
+                for n in others:
+                    path = tree_path(hub, n)  # n ... hub
+                    cycle = [(leaf, hub)] + [e for e in zip(path, path[1:])
+                                             if e[0] not in frozen and e[1] not in frozen]
+                    for a, b in cycle:
+                        touched = (leaf, hub, n, a, b)
+                        before = stubs_near(touched)
+                        self._remove_wall(*leaf, *n)
+                        self._add_wall(*a, *b)
+                        if stubs_near(touched) < before:
+                            swaps += 1
+                            done = True
+                            break
+                        self._add_wall(*leaf, *n)
+                        self._remove_wall(*a, *b)
+                    if done:
+                        break
+                progress = progress or done
+        return swaps
+
+    def count_short_dead_ends(self):
+        """Dead ends one cell long: a leaf whose only neighbour is a junction."""
+        def degree(r, c):
+            return sum(1 for n in self._neighbors(r, c) if self._wall_open(r, c, *n))
+        count = 0
+        for r in range(self.rows):
+            for c in range(self.cols):
+                if (r, c) in (self.start, self.goal):
+                    continue
+                nbrs = [n for n in self._neighbors(r, c) if self._wall_open(r, c, *n)]
+                if len(nbrs) == 1 and degree(*nbrs[0]) >= 3:
+                    count += 1
+        return count
+
+    def _add_wall(self, r1, c1, r2, c2):
+        if r1 != r2:
+            self.h_walls[max(r1, r2)][c1] = True
+        else:
+            self.v_walls[r1][max(c1, c2)] = True
 
     def _generate_standard_dfs(self):
         visited = [[False for _ in range(self.cols)] for _ in range(self.rows)]
@@ -761,19 +1008,24 @@ class HighJunctionSingleSolutionMaze:
                 sol_dist_to_goal = abs(next_sol_step[0] - goal[0]) + abs(next_sol_step[1] - goal[1]) if next_sol_step else 0
                 
                 for fnr, fnc in false_branches:
-                    b_q = deque([(fnr, fnc, 1)])
+                    # Turns count along the route into the decoy: a decoy with
+                    # no turns is a straight corridor whose dead end can be seen
+                    # from the junction, however many steps deep it is.
+                    b_q = deque([(fnr, fnc, 1, (fnr - r, fnc - c), 0)])
                     b_vis = set([(r, c), (fnr, fnc)])
                     max_d = 1
+                    max_turns = 0
                     min_dist_to_goal = abs(fnr - goal[0]) + abs(fnc - goal[1])
                     decoy_closer_than_sol = (abs(fnr - goal[0]) + abs(fnc - goal[1])) < sol_dist_to_goal
-                    
+
                     while b_q:
-                        br, bc, d = b_q.popleft()
+                        br, bc, d, last_dir, turns = b_q.popleft()
                         if d > max_d: max_d = d
+                        if turns > max_turns: max_turns = turns
                         d_goal = abs(br - goal[0]) + abs(bc - goal[1])
                         if d_goal < min_dist_to_goal:
                             min_dist_to_goal = d_goal
-                            
+
                         for bdr, bdc, bw_type, bwr, bwc in [
                             (-1, 0, 'H', br, bc),
                             (1, 0, 'H', br+1, bc),
@@ -785,20 +1037,23 @@ class HighJunctionSingleSolutionMaze:
                                 blocked = self.h_walls[bwr][bwc] if bw_type == 'H' else self.v_walls[bwr][bwc]
                                 if not blocked:
                                     b_vis.add((bnr, bnc))
-                                    b_q.append((bnr, bnc, d + 1))
-                                    
+                                    b_q.append((bnr, bnc, d + 1, (bdr, bdc),
+                                                turns + ((bdr, bdc) != last_dir)))
+
                     branch_info.append({
                         'depth': max_d,
+                        'turns': max_turns,
                         'min_dist_to_goal': min_dist_to_goal,
                         'anti_greedy_lure': decoy_closer_than_sol
                     })
-                    
+
                 junctions.append({
                     'step_index': idx,
                     'cell': (r, c),
                     'total_choices': len(open_exits),
                     'branch_info': branch_info,
                     'decoy_depths': [b['depth'] for b in branch_info],
+                    'decoy_turns': [b['turns'] for b in branch_info],
                     'has_exit_lure': any(b['min_dist_to_goal'] <= 2 for b in branch_info),
                     'has_anti_greedy': any(b['anti_greedy_lure'] for b in branch_info)
                 })
@@ -812,28 +1067,41 @@ class HighJunctionSingleSolutionMaze:
         """Draw the sheet and save it to ``output_path`` (format from the extension).
 
         Every size is scaled from the original 1800 x 2400 design, so other page
-        sizes keep the same proportions. ``square_cells`` keeps cells square and
-        centres the grid instead of stretching it to fill the page.
+        sizes keep the same proportions. Cells are kept within 10% of square
+        (the grid is centred rather than stretched to fill an ill-fitting
+        page); ``square_cells`` makes them exactly square. Arrows, labels and
+        the title stay at least 0.2 in (at ``dpi``) from the page edge, where
+        most home printers cannot print.
         """
         w, h = image_size
         scale = min(w / 1800, h / 2400)
         if wall_thickness is None:
             wall_thickness = max(8, min(16, int(180 / max(self.rows, self.cols))))
             wall_thickness = max(2, int(round(wall_thickness * scale)))
+        safe = min(0.2 * (dpi or 300), 0.08 * min(w, h))
 
         img = Image.new("RGB", (w, h), background)
         draw = ImageDraw.Draw(img)
 
+        # The side margins hold the START/FINISH arrows and labels. The top and
+        # bottom only need that much room when an opening is on them; otherwise
+        # the grid takes the extra height.
+        vertical_openings = {"top", "bottom"} & {self.start_side, self.goal_side}
         margin_x = w * 240 / 1800
-        margin_y = h * 360 / 2400
+        margin_y = h * (360 if vertical_openings else 300) / 2400
         grid_w = w - 2 * margin_x
         grid_h = h - 2 * margin_y
         cell_w = grid_w / self.cols
         cell_h = grid_h / self.rows
         if square_cells:
             cell_w = cell_h = min(cell_w, cell_h)
-            margin_x = (w - cell_w * self.cols) / 2
-            margin_y = (h - cell_h * self.rows) / 2
+        else:
+            # An 8 x 8 grid on a 3:4 page would otherwise get cells ~27% taller
+            # than wide; cap the stretch and centre the grid instead.
+            cell_h = min(cell_h, cell_w * 1.1)
+            cell_w = min(cell_w, cell_h * 1.1)
+        margin_x = (w - cell_w * self.cols) / 2
+        margin_y = (h - cell_h * self.rows) / 2
 
         def center(r, c):
             return margin_x + (c + 0.5) * cell_w, margin_y + (r + 0.5) * cell_h
@@ -900,22 +1168,29 @@ class HighJunctionSingleSolutionMaze:
                     x = margin_x + c * cell_w
                     draw.ellipse([(x - r_cap, y - r_cap), (x + r_cap, y + r_cap)], fill=wall_color)
 
-        label_size = int(64 * scale)
-        self._draw_opening(draw, edge_point(self.start, self.start_side), self.start_side,
-                           start_label, label_size, scale, wall_color, inward=True)
-        self._draw_opening(draw, edge_point(self.goal, self.goal_side), self.goal_side,
-                           finish_label, label_size, scale, wall_color, inward=False)
-
+        font_title = th = None
         if title:
             font_title = load_font(int(96 * scale))
             tw, th = _text_size(draw, title, font_title)
-            if tw > w * 0.9:
-                font_title = load_font(max(12, int(96 * scale * w * 0.9 / tw)))
+            if tw > w - 2 * safe:
+                font_title = load_font(max(12, int(96 * scale * (w - 2 * safe) / tw)))
                 tw, th = _text_size(draw, title, font_title)
-            title_y = margin_y * 0.22
+
+        label_size = int(64 * scale)
+        # An arrow on the top wall has to leave room for the title above it.
+        top_reserve = th + 20 * scale if title else 0
+        self._draw_opening(draw, edge_point(self.start, self.start_side), self.start_side,
+                           start_label, label_size, scale, wall_color, inward=True,
+                           safe=safe, top_reserve=top_reserve)
+        self._draw_opening(draw, edge_point(self.goal, self.goal_side), self.goal_side,
+                           finish_label, label_size, scale, wall_color, inward=False,
+                           safe=safe, top_reserve=top_reserve)
+
+        if title:
+            # Centred in the top margin, or above the top-wall arrow.
+            title_y = max(safe, (margin_y - th) / 2)
             if "top" in (self.start_side, self.goal_side):
-                # Sit above the arrow on the top wall instead of across it.
-                title_y = max(10 * scale, margin_y - 200 * scale - th - 20 * scale)
+                title_y = safe
             draw.text(((w - tw) / 2, title_y), title, fill=wall_color, font=font_title)
 
         save_kwargs = {"dpi": (dpi, dpi)} if dpi else {}
@@ -924,16 +1199,25 @@ class HighJunctionSingleSolutionMaze:
             print(f"Generated: {output_path}")
         return img
 
-    def _draw_opening(self, draw, edge, side, label, font_size, scale, color, inward):
+    def _draw_opening(self, draw, edge, side, label, font_size, scale, color, inward,
+                      safe=0, top_reserve=0):
         """Arrow (and optional label) outside an opening on the outer wall.
 
         START arrows point into the maze, FINISH arrows point out of it.
         Labels sit above/below arrows on the left and right walls, and beside
-        arrows on the top and bottom walls (toward the page centre).
+        arrows on the top and bottom walls (toward the page centre). Nothing is
+        drawn closer than ``safe`` px to the page edge; long labels shrink to
+        fit instead.
         """
+        img_w, img_h = draw.im.size
         ex, ey = edge
         dr, dc = _SIDE_VECTORS[side]
-        near, far = 30 * scale, 200 * scale
+        to_edge = {"left": ex, "right": img_w - ex, "top": ey, "bottom": img_h - ey}[side]
+        if side == "top":
+            to_edge -= top_reserve
+        near = 30 * scale
+        # The arrowhead overshoots the tip by 10 px (scaled); keep it inside too.
+        far = max(near + 60 * scale, min(200 * scale, to_edge - safe - 12 * scale))
         p_near = (ex + dc * near, ey + dr * near)
         p_far = (ex + dc * far, ey + dr * far)
         tail, tip = (p_far, p_near) if inward else (p_near, p_far)
@@ -949,28 +1233,28 @@ class HighJunctionSingleSolutionMaze:
 
         if not label:
             return
-        img_w = draw.im.size[0]
         font = load_font(font_size)
         tw, th = _text_size(draw, label, font)
-        if side in ("left", "right"):
-            # Shrink long labels until they fit in the side margin.
-            room = (ex if side == "left" else img_w - ex) - near - 10 * scale
-            if tw > room > 0:
-                font = load_font(max(10, int(font_size * room / tw)))
-                tw, th = _text_size(draw, label, font)
         mid_x = (p_near[0] + p_far[0]) / 2
         mid_y = (p_near[1] + p_far[1]) / 2
         gap = 25 * scale
         if side in ("left", "right"):
-            # Keep the text in the page margin, clear of the outer wall.
+            # Shrink long labels until they fit between the wall and the
+            # printable edge of the page.
+            room = (ex if side == "left" else img_w - ex) - near - max(safe, 10 * scale)
+            if tw > room > 0:
+                font = load_font(max(10, int(font_size * room / tw)))
+                tw, th = _text_size(draw, label, font)
             if side == "left":
-                x = max(10 * scale, ex - near - tw)
+                x = ex - near - tw
             else:
-                x = min(ex + near, img_w - tw - 10 * scale)
+                x = ex + near
             y = mid_y - gap - th if inward else mid_y + gap
         else:
             x = mid_x + gap if mid_x < img_w / 2 else mid_x - gap - tw
             y = mid_y - th / 2
+        x = min(max(x, safe), img_w - safe - tw)
+        y = min(max(y, safe), img_h - safe - th)
         draw.text((x, y), label, fill=color, font=font)
 
 
@@ -1019,14 +1303,43 @@ def _text_size(draw, text, font):
     return right - left, bottom
 
 
+def design_metrics(maze, solution, junctions):
+    """The AGENTS.md section 4 quality metrics for a solved maze, as a dict.
+
+    Shared by the seed scorer and the printed spec sheet so the two can never
+    disagree about what a maze scored.
+    """
+    n = len(solution)
+    depths = [d for j in junctions for d in j['decoy_depths']]
+    turns = [t for j in junctions for t in j['decoy_turns']]
+    return {
+        'solution_length': n,
+        'forks': len(junctions),
+        'four_way_forks': sum(1 for j in junctions if j['total_choices'] >= 4),
+        'min_depth': min(depths) if depths else 0,
+        'max_depth': max(depths) if depths else 0,
+        'deep_decoys': sum(1 for d in depths if d >= 5),
+        'min_turns': min(turns) if turns else 0,
+        'anti_greedy': sum(1 for j in junctions if j['has_anti_greedy']),
+        'exit_lures': sum(1 for j in junctions if j['has_exit_lure']),
+        # Forks in the final 15% of the solution, and how far in the first
+        # decision comes: long fork-free stretches at either end let a child
+        # coast (or solve backwards from FINISH) without choosing anything.
+        'late_branches': sum(1 for j in junctions if j['step_index'] >= n * 0.85),
+        'first_fork_step': junctions[0]['step_index'] if junctions else n,
+        'early_fork': bool(junctions) and junctions[0]['step_index'] <= max(3, int(n * 0.15)),
+        'short_dead_ends': maze.count_short_dead_ends(),
+    }
+
+
 def score_seed(args):
     """Build one candidate maze and score it. Module-level so it can be pickled
     across worker processes; seeds are independent, so the search parallelises.
 
     ``args`` is ``(rows, cols, seed)`` or ``(rows, cols, seed, maze_options)``.
     Returns ``(seed, score, meets_spec)``: ``meets_spec`` is True when the maze
-    hits every quality target in AGENTS.md section 4, which lets the search
-    stop early once enough such candidates have turned up.
+    hits every quality target in AGENTS.md section 4. The search ranks such
+    candidates above all others and stops early once enough have turned up.
     """
     rows, cols, s = args[:3]
     maze_options = args[3] if len(args) > 3 else {}
@@ -1035,14 +1348,7 @@ def score_seed(args):
     sol, junctions = m.solve()
     if not sol:
         return s, -1e9, False
-
-    all_depths = [d for j in junctions for d in j['decoy_depths']]
-    min_depth = min(all_depths) if all_depths else 0
-    max_depth = max(all_depths) if all_depths else 0
-    deep_decoys = sum(1 for d in all_depths if d >= 5)
-    exit_lures = sum(1 for j in junctions if j['has_exit_lure'])
-    anti_greedy = sum(1 for j in junctions if j['has_anti_greedy'])
-    late_branches = sum(1 for j in junctions if j['step_index'] >= len(sol) - 4)
+    k = design_metrics(m, sol, junctions)
 
     # The spec asks for 5-9 decision forks: make any candidate inside that band
     # outrank every candidate outside it, rather than merely nudging the score.
@@ -1051,31 +1357,36 @@ def score_seed(args):
     # deep (measured: 0 of 400 seeds manage both at 8x8), and the project's first
     # design rule is zero short dead ends, so depth wins on small sheets.
     enforce_band = total_cells >= 100
-    in_band = 5 <= len(junctions) <= 9
+    in_band = 5 <= k['forks'] <= 9
     in_band_bonus = 500 if (enforce_band and in_band) else 0
 
     score = (
         in_band_bonus +
-        len(junctions) * 15 +
-        deep_decoys * 20 +
-        anti_greedy * 45 +
-        exit_lures * 40 +
-        min_depth * 40 +
-        (200 if min_depth >= 5 else 0) +
-        (30 if max_depth >= 15 else 0) -
-        (late_branches * 100)
+        k['forks'] * 15 +
+        k['deep_decoys'] * 20 +
+        k['anti_greedy'] * 45 +
+        k['exit_lures'] * 40 +
+        k['min_depth'] * 40 +
+        (200 if k['min_depth'] >= 5 else 0) +
+        (30 if k['max_depth'] >= 15 else 0) +
+        (60 if k['four_way_forks'] else 0) +
+        (60 if k['early_fork'] else 0) +
+        (60 if k['min_turns'] >= 2 else 0) -
+        k['short_dead_ends'] * 25 -
+        k['late_branches'] * 100
     )
 
-    viable = (len(junctions) >= 4 and
+    viable = (k['forks'] >= 4 and
               int(total_cells * 0.25) <= len(sol) <= int(total_cells * 0.55))
     if not viable:
         # Still ranked among themselves (classic styles rarely pass the length
         # window), but always below every viable candidate.
         return s, score - 1e6, False
 
-    meets_spec = ((in_band if enforce_band else len(junctions) >= 4) and
-                  min_depth >= 5 and max_depth >= 15 and anti_greedy >= 2 and
-                  exit_lures >= 1 and late_branches == 0)
+    meets_spec = ((in_band if enforce_band else k['forks'] >= 4) and
+                  k['min_depth'] >= 5 and k['max_depth'] >= 15 and k['anti_greedy'] >= 2 and
+                  k['exit_lures'] >= 1 and k['late_branches'] == 0 and
+                  k['early_fork'] and k['min_turns'] >= 2)
     return s, score, meets_spec
 
 
@@ -1325,18 +1636,24 @@ def generate_one(rows, cols, seed, maze_path, solution_path, max_search=None, jo
         print(f"Searched {evaluated} of {len(candidates)} candidates "
               f"({hits} met every quality target).")
 
-        viable = [(s, sc) for s, sc, _ in results if sc > -1e5]
+        viable = [(s, sc, ok) for s, sc, ok in results if sc > -1e5]
         if not viable:
-            viable = [(s, sc) for s, sc, _ in results]
-        viable.sort(key=lambda item: (-item[1], item[0]))
+            viable = list(results)
+        # Candidates that meet every quality target outrank the rest outright:
+        # the weighted score alone can put a maze that misses a target (say, a
+        # 13-step deepest decoy) above one that meets them all.
+        viable.sort(key=lambda item: (not item[2], -item[1], item[0]))
 
         if deterministic or pool_rng is None:
             seed = viable[0][0]
         else:
             # Pick at random among the joint-best candidates so two runs of the same
             # size rarely land on the same sheet, without settling for a worse maze.
+            # Never widen the pick past the spec-meeting candidates when any exist.
             k = max(1, min(top_k, len(viable)))
-            seed = pool_rng.choice([s for s, _ in viable[:k]])
+            if viable[0][2]:
+                k = min(k, sum(1 for item in viable if item[2]))
+            seed = pool_rng.choice([item[0] for item in viable[:k]])
 
     maze = HighJunctionSingleSolutionMaze(rows=rows, cols=cols, seed=seed, **maze_options)
     solution, junctions = maze.solve()
@@ -1347,11 +1664,7 @@ def generate_one(rows, cols, seed, maze_path, solution_path, max_search=None, jo
     maze.render(maze_path, draw_solution=False, **opts)
     maze.render(solution_path, draw_solution=True, **opts)
 
-    all_depths = [d for j in junctions for d in j['decoy_depths']]
-    min_d = min(all_depths) if all_depths else 0
-    max_d = max(all_depths) if all_depths else 0
-    exit_lures = sum(1 for j in junctions if j['has_exit_lure'])
-    anti_greedy_forks = sum(1 for j in junctions if j['has_anti_greedy'])
+    metrics = design_metrics(maze, solution, junctions)
 
     repro = f"--rows {rows} --cols {cols} --seed {seed}"
     if algorithm != "deceptive":
@@ -1371,16 +1684,20 @@ def generate_one(rows, cols, seed, maze_path, solution_path, max_search=None, jo
     else:
         print(f"Graph Property: Mathematically Proven Tree (EXACTLY 1 UNIQUE SOLUTION)")
     print(f"Solution Path Length: {len(solution)} steps")
-    print(f"Decision Junctions: {len(junctions)} total forks")
-    print(f"Min Decoy Depth on Main Path: {min_d} steps (Zero short dead ends)")
-    print(f"Max Decoy Depth: {max_d} steps")
-    print(f"Anti-Greedy Deceptive Forks: {anti_greedy_forks} junctions (False branch moves closer to goal than solution)")
-    print(f"Near-Miss Exit Lures: {exit_lures} lures (Decoys reaching within <= 2 cells of FINISH)")
+    print(f"Decision Junctions: {metrics['forks']} total forks ({metrics['four_way_forks']} four-way)")
+    print(f"First Decision: step {metrics['first_fork_step']} (target: within first 15%)   "
+          f"Forks in final 15%: {metrics['late_branches']} (target 0)")
+    print(f"Min Decoy Depth on Main Path: {metrics['min_depth']} steps (Zero short dead ends)")
+    print(f"Max Decoy Depth: {metrics['max_depth']} steps")
+    print(f"Min Decoy Turns: {metrics['min_turns']} (target >= 2, so no decoy's dead end is visible from its fork)")
+    print(f"1-Cell Dead Ends Anywhere: {metrics['short_dead_ends']} (fewer is cleaner)")
+    print(f"Anti-Greedy Deceptive Forks: {metrics['anti_greedy']} junctions (False branch moves closer to goal than solution)")
+    print(f"Near-Miss Exit Lures: {metrics['exit_lures']} lures (Decoys reaching within <= 2 cells of FINISH)")
     print("-------------------------------------------------------------------------")
     for idx, j in enumerate(junctions):
         anti_str = " [ANTI-GREEDY LURE]" if j['has_anti_greedy'] else ""
         exit_str = " [NEAR-MISS EXIT LURE]" if j['has_exit_lure'] else ""
-        print(f"  Junction #{idx+1:02d} (Step {j['step_index']:02d}, Cell {j['cell']}): {j['total_choices']} Open Choices -> False Path Depths = {j['decoy_depths']} steps{anti_str}{exit_str}")
+        print(f"  Junction #{idx+1:02d} (Step {j['step_index']:02d}, Cell {j['cell']}): {j['total_choices']} Open Choices -> False Path Depths = {j['decoy_depths']} steps, turns {j['decoy_turns']}{anti_str}{exit_str}")
     print("=========================================================================\n")
 
     return maze_path, solution_path
